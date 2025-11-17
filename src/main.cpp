@@ -17,14 +17,57 @@
     #define SERVICE_UUID        "50106842-26c7-4e08-a41e-dda4319c2fc5"
     #define CHARACTERISTIC_UUID "2c5d2e0b-51ae-470e-8a4a-657207292a04"
     
+    // Circular buffer for offline archiving (500 last samples)
+    #define MAX_BUFFER_SIZE 500
+    #define ARCHIVE_PATH "/archive.log"
+    
+    // Circular buffer structure
+    struct CircularBuffer {
+        String samples[MAX_BUFFER_SIZE];
+        uint32_t head = 0;     // write position
+        uint32_t count = 0;    // number of stored samples (0 to MAX_BUFFER_SIZE)
+        
+        void add(const String &payload) {
+            samples[head] = payload;
+            head = (head + 1) % MAX_BUFFER_SIZE;
+            if (count < MAX_BUFFER_SIZE) {
+                count++;
+            }
+        }
+        
+        void flush() {
+            if (count == 0) return;
+            // write all samples to file
+            SPIFFS.remove(ARCHIVE_PATH);
+            File f = SPIFFS.open(ARCHIVE_PATH, FILE_WRITE);
+            if (!f) return;
+            
+            uint32_t pos = (head - count + MAX_BUFFER_SIZE) % MAX_BUFFER_SIZE;
+            for (uint32_t i = 0; i < count; i++) {
+                f.println(samples[pos]);
+                pos = (pos + 1) % MAX_BUFFER_SIZE;
+            }
+            f.close();
+            Serial.println("Buffer flushed to SPIFFS");
+        }
+        
+        void clear() {
+            head = 0;
+            count = 0;
+        }
+    };
+    
+    static CircularBuffer archiveBuffer;
+    
+    // Packet sequence counter (for tracking)
+    static uint32_t packetSeq = 0;
+    
     BLECharacteristic *pCharacteristic;
     static bool deviceConnected = false;
 
-    // Archive file path
-    static const char *ARCHIVE_PATH = "/archive.log";
-
     // forward declarations
     void flushArchive();
+    void loadArchiveFromDisk();
 
     class MyServerCallbacks : public BLEServerCallbacks {
         void onConnect(BLEServer* pServer) override {
@@ -49,47 +92,67 @@
         return true;
     }
 
-    // append payload to archive (SPIFFS)
-    void archiveData(const String &payload) {
-        File f = SPIFFS.open(ARCHIVE_PATH, FILE_APPEND);
-        if (!f) {
-            Serial.println("Failed to open archive for append");
+    // Load archived data from disk into buffer on startup
+    void loadArchiveFromDisk() {
+        if (!SPIFFS.exists(ARCHIVE_PATH)) {
+            Serial.println("No archive file to load");
             return;
         }
-        f.println(payload);
-        f.close();
-    }
-
-    // try to send archived lines and remove archive on success
-    void flushArchive() {
-        if (!SPIFFS.exists(ARCHIVE_PATH)) return;
         File f = SPIFFS.open(ARCHIVE_PATH, FILE_READ);
         if (!f) {
-            Serial.println("Failed to open archive for read");
+            Serial.println("Failed to open archive");
             return;
         }
-        // send each line
-        bool allSent = true;
-        while (f.available()) {
+        uint32_t loaded = 0;
+        while (f.available() && archiveBuffer.count < MAX_BUFFER_SIZE) {
             String line = f.readStringUntil('\n');
             line.trim();
-            if (line.length() == 0) continue;
+            if (line.length() > 0) {
+                archiveBuffer.add(line);
+                loaded++;
+            }
+        }
+        f.close();
+        Serial.print("Loaded ");
+        Serial.print(loaded);
+        Serial.println(" samples from disk");
+    }
+
+    // try to send archived data via BLE and remove archive on success
+    void flushArchive() {
+        if (archiveBuffer.count == 0) {
+            Serial.println("Archive buffer empty");
+            return;
+        }
+        
+        // send each sample from buffer
+        uint32_t pos = (archiveBuffer.head - archiveBuffer.count + MAX_BUFFER_SIZE) % MAX_BUFFER_SIZE;
+        bool allSent = true;
+        for (uint32_t i = 0; i < archiveBuffer.count; i++) {
             if (deviceConnected) {
-                sendDataNow(line);
+                sendDataNow(archiveBuffer.samples[pos]);
                 delay(10);
             } else {
                 allSent = false;
                 break;
             }
+            pos = (pos + 1) % MAX_BUFFER_SIZE;
         }
-        f.close();
+        
         if (allSent) {
+            Serial.print("Archive flushed: sent ");
+            Serial.print(archiveBuffer.count);
+            Serial.println(" samples");
+            archiveBuffer.clear();
             SPIFFS.remove(ARCHIVE_PATH);
-            Serial.println("Archive flushed and removed");
+            Serial.println("Buffer cleared, archive file removed");
         } else {
             Serial.println("Archive flush incomplete (still offline)");
+            // save buffer to disk for later
+            archiveBuffer.flush();
         }
     }
+
 
     SensirionI2cSps30 sps30;
     SensirionI2CSgp40 sgp40;
@@ -105,9 +168,9 @@
     unsigned long lastReadSps30 = 0;
     unsigned long lastReadSgp40 = 0;
     unsigned long lastReadScd41 = 0;
-    const unsigned long INTERVAL_SPS30 = 10000;   // 10 second
-    const unsigned long INTERVAL_SGP40 = 10000;   // 10 second
-    const unsigned long INTERVAL_SCD41 = 10000;   // 10 seconds
+    const unsigned long INTERVAL_SPS30 = 30000;   // 30 seconds
+    const unsigned long INTERVAL_SGP40 = 30000;   // 30 seconds
+    const unsigned long INTERVAL_SCD41 = 30000;   // 30 seconds
 
     void PrintUint64(uint64_t& value) {
     Serial.print("0x");
@@ -366,6 +429,9 @@
         // init SPIFFS for archive
         if (!SPIFFS.begin(true)) {
             Serial.println("SPIFFS Mount Failed");
+        } else {
+            Serial.println("SPIFFS initialized, loading archive...");
+            loadArchiveFromDisk();
         }
 
         Wire.begin();
@@ -424,17 +490,19 @@
 
         // If we have fresh readings from all sensors, send one combined JSON
         if (latestMeasurement.haveSps30 && latestMeasurement.haveSgp40 && latestMeasurement.haveScd41) {
-            // build compact combined JSON payload (Option A)
-            // t = timestamp(ms), c = CO2, T = temperature, H = humidity
-            // v = SRAW_VOC, p = [mc1p0, mc2p5, mc4p0, mc10p0], pm25 = mc2p5, pm10 = mc10p0
+            // build improved combined JSON payload with readable names
+            // seq = sequence number (for tracking), ts = timestamp(ms)
+            // co2 = CO2 [ppm], temp_c = temperature [°C], humidity_rh = humidity [%]
+            // voc = SRAW_VOC, pm25 = PM2.5 [µg/m³], pm10 = PM10 [µg/m³]
             unsigned long ts = latestMeasurement.ts;
+            packetSeq++;  // increment sequence counter
             String payload = "{";
-            payload += "\"t\":" + String(ts) + ",";
-            payload += "\"c\":" + String(latestMeasurement.co2) + ",";
-            payload += "\"T\":" + String(latestMeasurement.temp, 2) + ",";
-            payload += "\"H\":" + String(latestMeasurement.rh, 2) + ",";
-            payload += "\"v\":" + String(latestMeasurement.srawVoc) + ",";
-            // only include pm2.5 and pm10 as requested
+            payload += "\"seq\":" + String(packetSeq) + ",";
+            payload += "\"ts\":" + String(ts) + ",";
+            payload += "\"co2\":" + String(latestMeasurement.co2) + ",";
+            payload += "\"temp_c\":" + String(latestMeasurement.temp, 2) + ",";
+            payload += "\"humidity_rh\":" + String(latestMeasurement.rh, 2) + ",";
+            payload += "\"voc\":" + String(latestMeasurement.srawVoc) + ",";
             payload += "\"pm25\":" + String(latestMeasurement.mc2p5) + ",";
             payload += "\"pm10\":" + String(latestMeasurement.mc10p0);
             payload += "}";
@@ -442,8 +510,11 @@
             bool sent = false;
             if (deviceConnected) sent = sendDataNow(payload);
             if (!sent) {
-                archiveData(payload);
-                Serial.println("Combined data archived (no BLE)");
+                // add to circular buffer (no SPIFFS write yet)
+                archiveBuffer.add(payload);
+                Serial.print("Combined data archived to buffer (");
+                Serial.print(archiveBuffer.count);
+                Serial.println("/500 samples)");
             } else {
                 Serial.println("Combined data sent via BLE");
             }
