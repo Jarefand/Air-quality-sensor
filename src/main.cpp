@@ -16,6 +16,7 @@
     #define NO_ERROR 0
     #define SERVICE_UUID        "50106842-26c7-4e08-a41e-dda4319c2fc5"
     #define CHARACTERISTIC_UUID "2c5d2e0b-51ae-470e-8a4a-657207292a04"
+    #define STATUS_UUID         "9f1d2e0b-51ae-470e-8a4a-657207292a05"
     
     // Circular buffer for offline archiving (500 last samples)
     #define MAX_BUFFER_SIZE 500
@@ -55,25 +56,64 @@
             head = 0;
             count = 0;
         }
+        
+        // peek at oldest sample without removing
+        String peekFront() const {
+            if (count == 0) return String();
+            uint32_t pos = (head + MAX_BUFFER_SIZE - count) % MAX_BUFFER_SIZE;
+            return samples[pos];
+        }
+
+        // remove and return oldest sample
+        String popFront() {
+            if (count == 0) return String();
+            uint32_t pos = (head + MAX_BUFFER_SIZE - count) % MAX_BUFFER_SIZE;
+            String s = samples[pos];
+            // optional: clear stored String to free memory
+            samples[pos] = String();
+            count--;
+            return s;
+        }
     };
     
     static CircularBuffer archiveBuffer;
-    
+
     // Packet sequence counter (for tracking)
     static uint32_t packetSeq = 0;
-    
+
     BLECharacteristic *pCharacteristic;
+    BLECharacteristic *pStatusCharacteristic; // read-only status
     static bool deviceConnected = false;
+
+    // BLE notify throttle
+    static unsigned long lastNotifyTs = 0;
+    const unsigned long NOTIFY_INTERVAL_MS = 100; // 100ms between notifies (~10/sec)
+
+    // Flushing state (non-blocking flush)
+    static bool flushing = false;
+    static uint32_t flushPos = 0; // position index for incremental flush
+
+    // Sensor recovery timestamps
+    static unsigned long lastSuccessSps30 = 0;
+    static unsigned long lastSuccessSgp40 = 0;
+    static unsigned long lastSuccessScd41 = 0;
+    const unsigned long SENSOR_RECOVERY_TIMEOUT = 2 * 60 * 1000UL; // 2 minutes
+
+    // status update interval
+    unsigned long lastStatusUpdate = 0;
+    const unsigned long STATUS_UPDATE_INTERVAL = 10000; // 10s
 
     // forward declarations
     void flushArchive();
     void loadArchiveFromDisk();
+    void startFlushArchive();
+    void processFlushStep();
 
     class MyServerCallbacks : public BLEServerCallbacks {
         void onConnect(BLEServer* pServer) override {
             deviceConnected = true;
-            // try to flush archived data when a client connects
-            flushArchive();
+            // start non-blocking flush of archived data when a client connects
+            startFlushArchive();
         }
         void onDisconnect(BLEServer* pServer) override {
             deviceConnected = false;
@@ -84,11 +124,17 @@
     bool sendDataNow(const String &payload) {
         if (!pCharacteristic) return false;
         if (!deviceConnected) return false;
+        unsigned long now = millis();
+        if (now - lastNotifyTs < NOTIFY_INTERVAL_MS) {
+            // too soon to notify again, caller should retry later
+            return false;
+        }
         // print payload to serial so we can see what is being sent over BLE
         Serial.print("Sending via BLE: ");
         Serial.println(payload);
         pCharacteristic->setValue((uint8_t*)payload.c_str(), payload.length());
         pCharacteristic->notify();
+        lastNotifyTs = now;
         return true;
     }
 
@@ -118,38 +164,60 @@
         Serial.println(" samples from disk");
     }
 
-    // try to send archived data via BLE and remove archive on success
+    // Save buffer to disk immediately (used when we cannot send right now)
     void flushArchive() {
+        archiveBuffer.flush();
+    }
+
+    // Start non-blocking flush: initialize position pointer
+    void startFlushArchive() {
         if (archiveBuffer.count == 0) {
-            Serial.println("Archive buffer empty");
+            Serial.println("Nothing to flush (buffer empty)");
             return;
         }
-        
-        // send each sample from buffer
-        uint32_t pos = (archiveBuffer.head - archiveBuffer.count + MAX_BUFFER_SIZE) % MAX_BUFFER_SIZE;
-        bool allSent = true;
-        for (uint32_t i = 0; i < archiveBuffer.count; i++) {
-            if (deviceConnected) {
-                sendDataNow(archiveBuffer.samples[pos]);
-                delay(10);
-            } else {
-                allSent = false;
-                break;
-            }
-            pos = (pos + 1) % MAX_BUFFER_SIZE;
-        }
-        
-        if (allSent) {
-            Serial.print("Archive flushed: sent ");
-            Serial.print(archiveBuffer.count);
-            Serial.println(" samples");
-            archiveBuffer.clear();
+        flushPos = (archiveBuffer.head + MAX_BUFFER_SIZE - archiveBuffer.count) % MAX_BUFFER_SIZE;
+        flushing = true;
+        Serial.print("Starting non-blocking flush of ");
+        Serial.print(archiveBuffer.count);
+        Serial.println(" samples");
+    }
+
+    // Called periodically from loop() to send one archived sample at a time
+    void processFlushStep() {
+        if (!flushing) return;
+        if (archiveBuffer.count == 0) {
+            Serial.println("Flush complete (buffer empty)");
+            flushing = false;
             SPIFFS.remove(ARCHIVE_PATH);
-            Serial.println("Buffer cleared, archive file removed");
-        } else {
-            Serial.println("Archive flush incomplete (still offline)");
-            // save buffer to disk for later
+            return;
+        }
+        if (!deviceConnected) {
+            Serial.println("Client disconnected during flush, saving buffer to disk");
             archiveBuffer.flush();
+            flushing = false;
+            return;
+        }
+
+        // peek oldest sample and try to send once
+        String &sample = archiveBuffer.samples[flushPos];
+        if (sample.length() == 0) {
+            // shouldn't happen but be robust
+            archiveBuffer.popFront();
+            flushPos = (flushPos + 1) % MAX_BUFFER_SIZE;
+            return;
+        }
+
+        bool ok = sendDataNow(sample);
+        if (ok) {
+            // remove the sent sample
+            archiveBuffer.popFront();
+            // flushPos already points to oldest; after popFront oldest is next pos
+            flushPos = (flushPos) % MAX_BUFFER_SIZE; // remain correct
+            // continue next iteration (but we only do one per loop call)
+        } else {
+            // send failed - likely throttled; try again later
+            // do not remove sample; just return and try next loop
+            return;
         }
     }
 
@@ -265,6 +333,7 @@
         latestMeasurement.srawVoc = srawVoc;
         latestMeasurement.haveSgp40 = true;
         latestMeasurement.ts = millis();
+        lastSuccessSgp40 = millis();
     }
 
     void diagSps30() {
@@ -331,6 +400,7 @@
         latestMeasurement.typicalParticleSize = typicalParticleSize;
         latestMeasurement.haveSps30 = true;
         latestMeasurement.ts = millis();
+        lastSuccessSps30 = millis();
     }
 
     void diagScd41() {
@@ -417,6 +487,7 @@
         latestMeasurement.rh = rh;
         latestMeasurement.haveScd41 = true;
         latestMeasurement.ts = millis();
+        lastSuccessScd41 = millis();
     }
 
     void setup() {
@@ -452,6 +523,13 @@
                             BLECharacteristic::PROPERTY_READ |  // Ta charakterystyka jest CZYTELNA
                             BLECharacteristic::PROPERTY_NOTIFY // Można ją "subskrybować" (dostawać powiadomienia)
                             );
+    // Status characteristic (read-only) - returns buffer and device state
+    pStatusCharacteristic = pService->createCharacteristic(
+                STATUS_UUID,
+                BLECharacteristic::PROPERTY_READ
+                );
+    // initial status
+    pStatusCharacteristic->setValue("{\"buffer\":0,\"connected\":false,\"seq\":0}");
         // 5. Start the service
         pService->start();
         // 6. Start "Advertising"
@@ -469,6 +547,35 @@
 
     void loop() {
         unsigned long now = millis();
+
+        // process one archival flush step if in progress (non-blocking)
+        processFlushStep();
+
+        // periodic status update characteristic
+        if (now - lastStatusUpdate >= STATUS_UPDATE_INTERVAL) {
+            lastStatusUpdate = now;
+            char statusBuf[128];
+            int n = snprintf(statusBuf, sizeof(statusBuf), "{\"buffer\":%u,\"connected\":%s,\"seq\":%u}",
+                             (unsigned)archiveBuffer.count, deviceConnected ? "true" : "false", packetSeq);
+            if (n > 0) pStatusCharacteristic->setValue((uint8_t*)statusBuf, n);
+        }
+
+        // sensor recovery: if a sensor hasn't reported for SENSOR_RECOVERY_TIMEOUT, run its diag
+        if ((now - lastSuccessSps30) > SENSOR_RECOVERY_TIMEOUT) {
+            Serial.println("SPS30 not responding - running diagSps30()");
+            diagSps30();
+            lastSuccessSps30 = now; // avoid repeating too fast
+        }
+        if ((now - lastSuccessSgp40) > SENSOR_RECOVERY_TIMEOUT) {
+            Serial.println("SGP40 not responding - running diagSgp40()");
+            diagSgp40();
+            lastSuccessSgp40 = now;
+        }
+        if ((now - lastSuccessScd41) > SENSOR_RECOVERY_TIMEOUT) {
+            Serial.println("SCD41 not responding - running diagScd41()");
+            diagScd41();
+            lastSuccessScd41 = now;
+        }
 
         // Read SPS30 every INTERVAL_SPS30 ms
         if (now - lastReadSps30 >= INTERVAL_SPS30) {
@@ -496,16 +603,14 @@
             // voc = SRAW_VOC, pm25 = PM2.5 [µg/m³], pm10 = PM10 [µg/m³]
             unsigned long ts = latestMeasurement.ts;
             packetSeq++;  // increment sequence counter
-            String payload = "{";
-            payload += "\"seq\":" + String(packetSeq) + ",";
-            payload += "\"ts\":" + String(ts) + ",";
-            payload += "\"co2\":" + String(latestMeasurement.co2) + ",";
-            payload += "\"temp_c\":" + String(latestMeasurement.temp, 2) + ",";
-            payload += "\"humidity_rh\":" + String(latestMeasurement.rh, 2) + ",";
-            payload += "\"voc\":" + String(latestMeasurement.srawVoc) + ",";
-            payload += "\"pm25\":" + String(latestMeasurement.mc2p5) + ",";
-            payload += "\"pm10\":" + String(latestMeasurement.mc10p0);
-            payload += "}";
+            char payloadBuf[192];
+            int len = snprintf(payloadBuf, sizeof(payloadBuf), "{\"seq\":%u,\"ts\":%lu,\"co2\":%u,\"temp_c\":%.2f,\"humidity_rh\":%.2f,\"voc\":%u,\"pm25\":%u,\"pm10\":%u}",
+                               packetSeq, ts, latestMeasurement.co2, latestMeasurement.temp, latestMeasurement.rh,
+                               latestMeasurement.srawVoc, latestMeasurement.mc2p5, latestMeasurement.mc10p0);
+
+            String payload;
+            if (len > 0 && len < (int)sizeof(payloadBuf)) payload = String(payloadBuf);
+            else payload = String("{}");
 
             bool sent = false;
             if (deviceConnected) sent = sendDataNow(payload);
