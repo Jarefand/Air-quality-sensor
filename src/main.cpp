@@ -6,6 +6,7 @@
     #include <BLEDevice.h>  // Main library BLE
     #include <BLEServer.h>  // Library for creating Server
     #include <BLEUtils.h>   // Tools helpers
+    #include <SPIFFS.h>
 
     // macro definitions
     // make sure that we use the proper definition of NO_ERROR
@@ -17,6 +18,78 @@
     #define CHARACTERISTIC_UUID "2c5d2e0b-51ae-470e-8a4a-657207292a04"
     
     BLECharacteristic *pCharacteristic;
+    static bool deviceConnected = false;
+
+    // Archive file path
+    static const char *ARCHIVE_PATH = "/archive.log";
+
+    // forward declarations
+    void flushArchive();
+
+    class MyServerCallbacks : public BLEServerCallbacks {
+        void onConnect(BLEServer* pServer) override {
+            deviceConnected = true;
+            // try to flush archived data when a client connects
+            flushArchive();
+        }
+        void onDisconnect(BLEServer* pServer) override {
+            deviceConnected = false;
+        }
+    };
+
+    // send via BLE characteristic if connected
+    bool sendDataNow(const String &payload) {
+        if (!pCharacteristic) return false;
+        if (!deviceConnected) return false;
+        // print payload to serial so we can see what is being sent over BLE
+        Serial.print("Sending via BLE: ");
+        Serial.println(payload);
+        pCharacteristic->setValue((uint8_t*)payload.c_str(), payload.length());
+        pCharacteristic->notify();
+        return true;
+    }
+
+    // append payload to archive (SPIFFS)
+    void archiveData(const String &payload) {
+        File f = SPIFFS.open(ARCHIVE_PATH, FILE_APPEND);
+        if (!f) {
+            Serial.println("Failed to open archive for append");
+            return;
+        }
+        f.println(payload);
+        f.close();
+    }
+
+    // try to send archived lines and remove archive on success
+    void flushArchive() {
+        if (!SPIFFS.exists(ARCHIVE_PATH)) return;
+        File f = SPIFFS.open(ARCHIVE_PATH, FILE_READ);
+        if (!f) {
+            Serial.println("Failed to open archive for read");
+            return;
+        }
+        // send each line
+        bool allSent = true;
+        while (f.available()) {
+            String line = f.readStringUntil('\n');
+            line.trim();
+            if (line.length() == 0) continue;
+            if (deviceConnected) {
+                sendDataNow(line);
+                delay(10);
+            } else {
+                allSent = false;
+                break;
+            }
+        }
+        f.close();
+        if (allSent) {
+            SPIFFS.remove(ARCHIVE_PATH);
+            Serial.println("Archive flushed and removed");
+        } else {
+            Serial.println("Archive flush incomplete (still offline)");
+        }
+    }
 
     SensirionI2cSps30 sps30;
     SensirionI2CSgp40 sgp40;
@@ -43,6 +116,37 @@
 }
 
     // --- Diagnostics and read helpers for each sensor ---
+    // consolidated data structure for a full measurement
+    struct AirMeasurement {
+        // SPS30
+        uint16_t mc1p0 = 0;
+        uint16_t mc2p5 = 0;
+        uint16_t mc4p0 = 0;
+        uint16_t mc10p0 = 0;
+        // optional number concentrations
+        uint16_t nc0p5 = 0;
+        uint16_t nc1p0 = 0;
+        uint16_t nc2p5 = 0;
+        uint16_t nc4p0 = 0;
+        uint16_t nc10p0 = 0;
+        uint16_t typicalParticleSize = 0;
+        bool haveSps30 = false;
+
+        // SGP40
+        uint16_t srawVoc = 0;
+        bool haveSgp40 = false;
+
+        // SCD41
+        uint16_t co2 = 0;
+        float temp = 0.0f;
+        float rh = 0.0f;
+        bool haveScd41 = false;
+
+        // timestamp for the combined payload (ms since boot)
+        unsigned long ts = 0;
+    };
+
+    static AirMeasurement latestMeasurement;
     void diagSgp40() {
         uint16_t error_sgp40 = 0;
         char errorMessage_sgp40[128];
@@ -89,10 +193,15 @@
             Serial.print("SGP40 measureRawSignal error: ");
             errorToString(error_sgp40, errorMessage_sgp40, sizeof errorMessage_sgp40);
             Serial.println(errorMessage_sgp40);
-        } else {
-            Serial.print("SRAW_VOC: ");
-            Serial.println(srawVoc);
+            latestMeasurement.haveSgp40 = false;
+            return;
         }
+        Serial.print("SRAW_VOC: ");
+        Serial.println(srawVoc);
+        // store reading in latestMeasurement (no sending here)
+        latestMeasurement.srawVoc = srawVoc;
+        latestMeasurement.haveSgp40 = true;
+        latestMeasurement.ts = millis();
     }
 
     void diagSps30() {
@@ -135,7 +244,7 @@
             return;
         }
 
-        Serial.print("mc1p0: "); Serial.print(mc1p0); Serial.print("\t");
+    Serial.print("mc1p0: "); Serial.print(mc1p0); Serial.print("\t");
         Serial.print("mc2p5: "); Serial.print(mc2p5); Serial.print("\t");
         Serial.print("mc4p0: "); Serial.print(mc4p0); Serial.print("\t");
         Serial.print("mc10p0: "); Serial.print(mc10p0); Serial.print("\t");
@@ -146,6 +255,19 @@
         Serial.print("nc10p0: "); Serial.print(nc10p0); Serial.print("\t");
         Serial.print("typicalParticleSize: "); Serial.print(typicalParticleSize);
         Serial.println();
+        // store SPS30 readings into latestMeasurement (do not send individually)
+        latestMeasurement.mc1p0 = mc1p0;
+        latestMeasurement.mc2p5 = mc2p5;
+        latestMeasurement.mc4p0 = mc4p0;
+        latestMeasurement.mc10p0 = mc10p0;
+        latestMeasurement.nc0p5 = nc0p5;
+        latestMeasurement.nc1p0 = nc1p0;
+        latestMeasurement.nc2p5 = nc2p5;
+        latestMeasurement.nc4p0 = nc4p0;
+        latestMeasurement.nc10p0 = nc10p0;
+        latestMeasurement.typicalParticleSize = typicalParticleSize;
+        latestMeasurement.haveSps30 = true;
+        latestMeasurement.ts = millis();
     }
 
     void diagScd41() {
@@ -226,6 +348,12 @@
         Serial.print("CO2 concentration [ppm]: "); Serial.println(co2);
         Serial.print("Temperature [°C]: "); Serial.println(temp);
         Serial.print("Relative Humidity [RH]: "); Serial.println(rh);
+        // store reading in latestMeasurement (no sending here)
+        latestMeasurement.co2 = co2;
+        latestMeasurement.temp = temp;
+        latestMeasurement.rh = rh;
+        latestMeasurement.haveScd41 = true;
+        latestMeasurement.ts = millis();
     }
 
     void setup() {
@@ -233,6 +361,11 @@
         Serial.begin(115200);
         while (!Serial) {
             delay(100);
+        }
+
+        // init SPIFFS for archive
+        if (!SPIFFS.begin(true)) {
+            Serial.println("SPIFFS Mount Failed");
         }
 
         Wire.begin();
@@ -243,7 +376,8 @@
         // 1. Start BLE and give your device a name
         BLEDevice::init("MojCzujnikPowietrza");
         // 2. create BLE Server
-        BLEServer *pServer = BLEDevice::createServer();
+    BLEServer *pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new MyServerCallbacks());
         // 3. Create a "Service" on that server
         BLEService *pService = pServer->createService(SERVICE_UUID);
         // 4. Create a "Characteristic" (data channel) inside that service
@@ -286,5 +420,37 @@
         if (now - lastReadScd41 >= INTERVAL_SCD41) {
             lastReadScd41 = now;
             readScd41();
+        }
+
+        // If we have fresh readings from all sensors, send one combined JSON
+        if (latestMeasurement.haveSps30 && latestMeasurement.haveSgp40 && latestMeasurement.haveScd41) {
+            // build compact combined JSON payload (Option A)
+            // t = timestamp(ms), c = CO2, T = temperature, H = humidity
+            // v = SRAW_VOC, p = [mc1p0, mc2p5, mc4p0, mc10p0], pm25 = mc2p5, pm10 = mc10p0
+            unsigned long ts = latestMeasurement.ts;
+            String payload = "{";
+            payload += "\"t\":" + String(ts) + ",";
+            payload += "\"c\":" + String(latestMeasurement.co2) + ",";
+            payload += "\"T\":" + String(latestMeasurement.temp, 2) + ",";
+            payload += "\"H\":" + String(latestMeasurement.rh, 2) + ",";
+            payload += "\"v\":" + String(latestMeasurement.srawVoc) + ",";
+            // only include pm2.5 and pm10 as requested
+            payload += "\"pm25\":" + String(latestMeasurement.mc2p5) + ",";
+            payload += "\"pm10\":" + String(latestMeasurement.mc10p0);
+            payload += "}";
+
+            bool sent = false;
+            if (deviceConnected) sent = sendDataNow(payload);
+            if (!sent) {
+                archiveData(payload);
+                Serial.println("Combined data archived (no BLE)");
+            } else {
+                Serial.println("Combined data sent via BLE");
+            }
+
+            // reset measurement flags so next cycle waits for new readings
+            latestMeasurement.haveSps30 = false;
+            latestMeasurement.haveSgp40 = false;
+            latestMeasurement.haveScd41 = false;
         }
     }
