@@ -84,6 +84,8 @@
     BLECharacteristic *pCharacteristic;
     BLECharacteristic *pStatusCharacteristic; // read-only status
     static bool deviceConnected = false;
+    // global advertising pointer so we can restart advertising after disconnect
+    BLEAdvertising *pAdvertising = nullptr;
 
     // BLE notify throttle
     static unsigned long lastNotifyTs = 0;
@@ -117,6 +119,11 @@
         }
         void onDisconnect(BLEServer* pServer) override {
             deviceConnected = false;
+            // restart advertising so the device is visible again after a disconnect
+            if (pAdvertising) {
+                pAdvertising->start();
+                Serial.println("Advertising restarted after disconnect");
+            }
         }
     };
 
@@ -532,8 +539,8 @@
     pStatusCharacteristic->setValue("{\"buffer\":0,\"connected\":false,\"seq\":0}");
         // 5. Start the service
         pService->start();
-        // 6. Start "Advertising"
-        BLEAdvertising *pAdvertising = pServer->getAdvertising();
+        // 6. Start "Advertising" and keep global pointer so callbacks can restart it
+        pAdvertising = pServer->getAdvertising();
         pAdvertising->addServiceUUID(SERVICE_UUID);
         pAdvertising->start();
 
